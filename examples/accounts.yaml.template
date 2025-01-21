@@ -1,0 +1,23 @@
+# accounts.yaml
+# Permissions: 600
+version: "1.0"
+
+accounts:
+  - email: "user1@domain.tld"
+    source_password: ""
+    dest_password: ""
+    enabled: true
+    retry_count: 0
+    folders:
+      - source: "Inbox"
+        dest: "INBOX"
+      - source: "Sent Items"
+        dest: "Sent"
+        
+  - email: "user2@domain.tld"
+    source_password: ""
+    dest_password: ""
+    enabled: true
+    retry_count: 0
+    
+  # Add more accounts as needed

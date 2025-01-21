@@ -1,0 +1,54 @@
+# system_config.yaml
+# Permissions: 600
+version: "1.0"
+
+azure:
+  subscription_id: ""
+  tenant_id: ""
+  client_id: ""
+  client_secret: ""
+  admin_email: ""
+
+source_system:
+  type: "ms365"
+  server: "outlook.office365.com"
+  port: 993
+  auth_type: "modern"
+  timeout: 30
+  retry_count: 3
+  delay: 2
+
+destination_system:
+  type: "modoboa"
+  server: "mailhost.domain.tld"
+  port: 993
+  auth_type: "basic"
+  ssl: true
+  timeout: 30
+  retry_count: 3
+  delay: 2
+
+paths:
+  base_dir: "/path/to/migration"
+  download_dir: "messages"
+  stats_dir: "stats"
+  temp_dir: "/tmp/migration"
+  log_dir: "logs"
+  state_dir: "state"
+  lock_dir: "locks"
+
+processing:
+  max_retries: 3
+  request_delay: 0.5
+  retry_delay: 2
+  verify_delay: 1
+  max_parallel_downloads: 3
+  max_parallel_uploads: 1
+  chunk_size: 10485760
+
+logging:
+  level: "info"
+  format: "standard"
+  retention: 30
+  max_size: 104857600
+

@@ -2,6 +2,11 @@
 
 A secure, robust tool for migrating email accounts from Microsoft 365 Exchange Online to Modoboa IMAP servers. Supports multi-account migration with state tracking and resume capabilities.
 
+## Attribution
+
+This project was created by Hawke Robinson, January 19th, 2025, President of Dev 2 Dev Portal LLC, advocates for open source. https://www.hawkerobinson.com
+
+
 ## Features
 
 - Full mailbox migration from MS365 to Modoboa
@@ -77,8 +82,8 @@ az extension add --name account
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/ms365-modoboa-migration.git
-   cd ms365-modoboa-migration
+   git clone https://github.com/dev2devportal/ms365-to-modoboa-imap-migrator.git
+   cd ms365-to-modoboa-imap-migrator
    ```
 
 2. Create configuration directory:
@@ -89,9 +94,8 @@ az extension add --name account
 
 3. Copy and customize configuration templates:
    ```bash
-   cp examples/system_config.yaml config/
-   cp examples/accounts.yaml config/
-   chmod 600 config/*.yaml
+   cp examples/system_config.yaml.template config/system_config.yaml
+   cp examples/accounts.yaml.tempate config/accounts.yaml
    ```
 
 4. Update configurations with your settings:
@@ -153,7 +157,7 @@ azure:
   tenant_id: "your-tenant-id"
   client_id: "your-application-id"
   client_secret: "your-client-secret"
-  admin_email: "admin@yourdomain.com"
+  admin_email: "admin@yourdomain.tld"
 
 source_system:
   type: "ms365"
@@ -166,7 +170,7 @@ source_system:
 
 destination_system:
   type: "modoboa"
-  server: "mail.yourdomain.com"
+  server: "mail.yourdomain.tld"
   port: 993
   auth_type: "basic"
   ssl: true
@@ -205,7 +209,7 @@ Configure `config/accounts.yaml`:
 version: "1.0"
 
 accounts:
-  - email: "user1@yourdomain.com"
+  - email: "user1@yourdomain.tld"
     source_password: "ms365-password"
     dest_password: "modoboa-password"
     enabled: true
@@ -216,7 +220,7 @@ accounts:
       - source: "Sent Items"
         dest: "Sent"
   
-  - email: "user2@yourdomain.com"
+  - email: "user2@yourdomain.tld"
     source_password: "ms365-password"
     dest_password: "modoboa-password"
     enabled: true
@@ -263,8 +267,8 @@ The migration tool provides a simple command-line interface through the `migrate
 Usage: ./migrate.sh [options] <command>
 
 Commands:
-    download            Download emails from MS365
-    upload             Upload emails to Modoboa
+    download           Download emails from MS365/O365 Exchange server
+    upload             Upload emails to Modoboa IMAP server
     status             Show migration status
     verify             Verify configuration
     help               Show this help message
@@ -480,7 +484,7 @@ Contributions are welcome! Please follow these steps:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU AFFERO GENERAL PUBLIC LICENSE Version 3, 19 November 2007 - see the LICENSE file for details.
 
 ## Acknowledgments
 

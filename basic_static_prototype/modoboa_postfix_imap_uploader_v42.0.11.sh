@@ -1,33 +1,12 @@
 #!/bin/bash
 
-# Upload to Modoboa Script v42.0.4
+# Upload to Modoboa IMAP Script v42.0.11
 # Changes from v41:
 # - Fixed verification to prevent duplicate uploads
 # - Changed to file-based locks instead of directories
 # - Added better message existence checking
 # - Improved error detection and handling
-# - Follows pagination with @odata.nextLink
-# - Attempt to improve rate limiting and retry logic
-# - Attempt to improgve folder processing logic
-# - Attempt to improve security measures
-# - Better detection of child folders using the expanded data
-# - Explicit depth tracking to handle deep nesting safely
-# - More detailed logging to diagnose issues
-# - Safer recursion with depth limits
-# - Better pagination handling at root level
-# - Fixed numeric comparison bugs
-# - More thorough folder hierarchy scanning
-# - Better error detection and logging
-# - Attempt to improve null handling in pagination
-# - Attempt to improve recursive folder traversal to match downloaded structure
-# - Depth tracking to prevent infinite recursion
-# - Better folder hierarchy handling
-# - Improved logging for debugging
-# - Try to maintain folder hierarchy in both IMAP and stats
-# - Process all folders including deeply nested ones
-# - Better path handling to prevent double slashes
-# - Trying to improve IMAP folder creation
-# - Security Requirements:
+# Security Requirements:
 # - SSL/TLS required for all connections
 # - Secure credential handling
 # - Atomic operations for all file updates
@@ -74,6 +53,9 @@ JOBS_DIR="$STATS_DIR/jobs"
 LOCK_DIR="$STATS_DIR/locks"
 UPLOAD_TRACKING_DIR="$STATS_DIR/uploads"
 MESSAGE_CACHE_DIR="$STATS_DIR/message_cache"  # New: Cache for message states
+
+
+
 
 # IMAP connection configuration
 OPENSSL_OPTS="-quiet -verify_hostname -verify_peer -tls1_2"
@@ -162,6 +144,14 @@ acquire_lock() {
     done
 }
 
+# # Function to release lock
+# release_lock() {
+#     local lock_file="$1"
+#     if [ -f "$lock_file" ] && [ "$(cat "$lock_file" 2>/dev/null)" = "$$" ]; then
+#         flock -u "$lock_file" 2>/dev/null
+#         rm -f "$lock_file"
+#     fi
+# }
 # Function to release lock
 release_lock() {
     local lock_file="$1"
@@ -484,134 +474,217 @@ authenticate_imap() {
 
 
 
-# Function to safely clean paths
+# Function to clean paths consistently
 clean_path() {
     local path="$1"
-    # Remove any double slashes and trailing slashes
     echo "${path//\/\//\/}" | sed 's/\/$//'
 }
 
-# Function to create IMAP folder with proper path cleaning
-create_imap_folder() {
-    local folder_path="$1"
-    local retries=0
-    local temp_file="$TEMP_DIR/create_folder_$$_${RANDOM}.txt"
-    
-    # Clean the folder path
-    folder_path=$(clean_path "$folder_path")
-    
-    # Create temp file with secure permissions
-    touch "$temp_file"
-    chmod 600 "$temp_file"
-    
-    log_message "Creating IMAP folder: $folder_path"
-    
-    while [ $retries -lt $MAX_RETRIES ]; do
-        # Try to create folder
-        (
-            printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
-            sleep 1
-            printf "a002 CREATE \"%s\"\r\n" "$folder_path"
-            sleep 1
-            printf "a003 LOGOUT\r\n"
-        ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
-        
-        if grep -q "^a002 OK\|ALREADYEXISTS" "$temp_file"; then
-            rm -f "$temp_file"
-            log_message "Folder ready: $folder_path"
-            return 0
-        fi
-        
-        log_message "Failed to create folder, retrying in $RETRY_DELAY seconds..."
-        sleep $RETRY_DELAY
-        retries=$((retries + 1))
-    done
-    
-    rm -f "$temp_file"
-    log_message "Failed to create folder after $MAX_RETRIES attempts: $folder_path"
-    return 1
-}
 
-# Function to process folder uploads with proper path handling
-process_folder_uploads() {
-    local source_folder="$1"
-    local dest_folder="$2"
-    local depth="${3:-0}"
-    local max_depth=10  # Prevent infinite recursion
+# Function to get Message-ID with proper carriage return handling and clean output
+get_message_id() {
+    local message_file="$1"
+    local msg_id
     
-    # Clean paths
-    source_folder=$(clean_path "$source_folder")
-    dest_folder=$(clean_path "$dest_folder")
+    # Try to get Message-ID header first - clean any line breaks
+    msg_id=$(grep -i "^Message-ID:" "$message_file" | head -1 | sed 's/^Message-ID: *//i' | tr -d '<>' | tr -d '\r' | tr -d '\n')
     
-    # Get relative path for stats
-    local relative_path="${source_folder#messages/}"
-    local lock_file="$LOCK_DIR/folder_${relative_path//\//_}.lock"
-    
-    # Prevent infinite recursion
-    if [ "$depth" -ge "$max_depth" ]; then
-        log_message "WARNING: Maximum folder depth reached for $dest_folder"
-        return 0
+    # If no Message-ID found, generate clean hash without logging text
+    if [ -z "$msg_id" ]; then
+        msg_id=$(md5sum "$message_file" | cut -d' ' -f1)
+        log_message "No Message-ID found, using content hash: $msg_id"
     fi
     
-    # Create folder on IMAP server
-    if ! create_imap_folder "$dest_folder"; then
-        log_message "Failed to create destination folder: $dest_folder"
+    echo "$msg_id"
+}
+
+
+
+# Function to check message existence on IMAP server with improved reliability
+# check_message_exists() {
+#     local folder_path="$1"
+#     local message_id="$2"
+#     local folder_name="$3"
+#     local temp_file="$TEMP_DIR/check_msg_$$_${RANDOM}.txt"
+    
+#     # Check state cache first
+#     local cached_state
+#     cached_state=$(check_message_state "$folder_name" "$message_id")
+#     if [ "$cached_state" = "uploaded" ] || [ "$cached_state" = "skipped" ]; then
+#         log_message "Message found in cache (state: $cached_state): $message_id"
+#         return 0
+#     fi
+    
+#     # Skip server check if in force mode
+#     if [ "$FORCE_MODE" = "true" ]; then
+#         return 1
+#     fi
+    
+#     # Create temp file with secure permissions
+#     touch "$temp_file"
+#     chmod 600 "$temp_file"
+    
+#     # Clean message ID and folder path
+#     message_id=$(echo "$message_id" | tr -d '\r' | tr -d '\n')
+#     folder_path=$(clean_path "$folder_path")
+    
+#     # Search for message on server
+#     (
+#         printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+#         sleep 1
+#         printf "a002 SELECT \"%s\"\r\n" "$folder_path"
+#         sleep 1
+#         printf "a003 SEARCH HEADER Message-ID \"%s\"\r\n" "$message_id"
+#         sleep 1
+#         printf "a004 LOGOUT\r\n"
+#     ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+    
+#     # Check if message exists using SEARCH response
+#     if grep -q "^\* SEARCH [1-9][0-9]*" "$temp_file"; then
+#         rm -f "$temp_file"
+#         log_message "Message found on server: $message_id"
+#         cache_message_state "$folder_name" "$message_id" "uploaded"
+#         return 0
+#     fi
+    
+#     rm -f "$temp_file"
+#     return 1
+# }
+
+
+# Function to upload message with proper Dovecot folder handling
+upload_message() {
+    local message_file="$1"
+    local folder_path="$2"
+    local folder_name="$3"
+    local retries=0
+    local job_id="$$_${RANDOM}"
+    local temp_file="$TEMP_DIR/upload_msg_${job_id}.txt"
+    local cmd_file="$TEMP_DIR/upload_cmd_${job_id}.txt"
+    
+    # Get Dovecot's separator and convert path
+    local separator
+    separator=$(get_dovecot_separator)
+    local imap_folder="${folder_path//\//$separator}"
+    
+    write_job_status "$job_id" "start" "Beginning upload process"
+    
+    # Get message ID first for duplicate checking
+    local message_id
+    message_id=$(get_message_id "$message_file")
+    if [ -z "$message_id" ]; then
+        log_message "Failed to get message identifier, skipping upload"
+        write_job_status "$job_id" "failed" "No Message-ID available"
+        update_upload_stats "$folder_name" 1 0 "false"
         return 1
     fi
     
-    # Process each message in current folder
-    local message_processed=0
-    for message_file in "$source_folder"/*.eml; do
-        if [ -f "$message_file" ]; then
-            # First check if message already exists
-            local message_id
-            message_id=$(get_message_id "$message_file")
-            
-            if [ -z "$message_id" ]; then
-                log_message "Failed to get message identifier, skipping upload"
-                continue
+    # Check if message already exists before doing anything else
+    if check_message_exists "$imap_folder" "$message_id" "$folder_name"; then
+        local message_size
+        message_size=$(stat -c%s "$message_file")
+        log_message "Message already exists, skipping (ID: $message_id)"
+        write_job_status "$job_id" "skipped" "Message already exists"
+        update_upload_stats "$folder_name" 1 "$message_size" "skipped"
+        return 0
+    fi
+    
+    # Verify message integrity
+    if ! verify_message_integrity "$message_file"; then
+        log_message "Message integrity check failed: $message_file"
+        write_job_status "$job_id" "failed" "Integrity check failed"
+        update_upload_stats "$folder_name" 1 0 "false"
+        return 1
+    fi
+    
+    # Get message size
+    local message_size
+    message_size=$(stat -c%s "$message_file")
+    
+    log_message "Uploading message to $imap_folder (size: $message_size bytes, ID: $message_id)"
+    write_job_status "$job_id" "uploading" "Size: $message_size bytes, ID: $message_id"
+    
+    # Create temp files with secure permissions
+    touch "$temp_file" "$cmd_file"
+    chmod 600 "$temp_file" "$cmd_file"
+    
+    local upload_success=false
+    
+    while [ $retries -lt $MAX_RETRIES ] && [ "$upload_success" = "false" ]; do
+        # Check again if message exists before each attempt
+        if check_message_exists "$imap_folder" "$message_id" "$folder_name"; then
+            log_message "Message appeared on server during retry, skipping (ID: $message_id)"
+            write_job_status "$job_id" "skipped" "Message appeared during retry"
+            update_upload_stats "$folder_name" 1 "$message_size" "skipped"
+            rm -f "$temp_file" "$cmd_file"
+            return 0
+        fi
+        
+        # Create command file for upload with proper folder separator
+        {
+            printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+            sleep 1
+            printf "a002 SELECT \"%s\"\r\n" "$imap_folder"
+            sleep 1
+            printf "a003 APPEND \"%s\" (\\Seen) {%d}\r\n" "$imap_folder" "$message_size"
+            sleep 1
+            cat "$message_file"
+            printf "\r\n"
+            sleep 1
+            printf "a004 LOGOUT\r\n"
+        } > "$cmd_file"
+        
+        # Execute upload with timeout
+        if timeout 30 cat "$cmd_file" | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"; then
+            if grep -q "^a003 OK" "$temp_file"; then
+                # Mark success if OK response received
+                upload_success=true
+            else
+                log_message "Upload command failed, retrying..."
             fi
-            
-            # Check if message exists before uploading
-            if check_message_exists "$dest_folder" "$message_id" "$relative_path"; then
-                local message_size
-                message_size=$(stat -c%s "$message_file")
-                log_message "Message already exists, skipping (ID: $message_id)"
-                update_upload_stats "$relative_path" 1 "$message_size" "skipped"
-                continue
+        else
+            log_message "Upload timed out or connection failed, retrying..."
+        fi
+        
+        if [ "$upload_success" = "false" ]; then
+            retries=$((retries + 1))
+            if [ $retries -lt $MAX_RETRIES ]; then
+                sleep $RETRY_DELAY
             fi
-            
-            upload_message "$message_file" "$dest_folder" "$relative_path"
-            sleep $REQUEST_DELAY
-            message_processed=1
         fi
     done
     
-    # Process nested folders
-    for subfolder in "$source_folder"/*/; do
-        if [ -d "$subfolder" ]; then
-            local sub_name=$(basename "$subfolder")
-            local sub_dest="$dest_folder/$sub_name"
-            
-            process_folder_uploads "$subfolder" "$sub_dest" "$((depth + 1))"
-            sleep $REQUEST_DELAY
-        fi
-    done
+    rm -f "$temp_file" "$cmd_file"
     
-    return 0
+    if [ "$upload_success" = "true" ]; then
+        # Verify upload and update stats
+        if verify_message_upload "$imap_folder" "$message_id" "$folder_name"; then
+            update_upload_stats "$folder_name" 1 "$message_size" "true"
+            write_job_status "$job_id" "completed" "Successfully uploaded and verified"
+            log_message "Successfully uploaded and verified message (size: $message_size bytes, ID: $message_id)"
+            return 0
+        else
+            log_message "Upload appeared successful but verification failed (ID: $message_id)"
+        fi
+    fi
+    
+    log_message "Failed to upload message after $MAX_RETRIES attempts (ID: $message_id)"
+    write_job_status "$job_id" "failed" "Failed after $MAX_RETRIES attempts"
+    update_upload_stats "$folder_name" 1 0 "false"
+    return 1
 }
 
-
-
-
-
-
-# Function to check message existence on IMAP server
+# Update check_message_exists to use Dovecot separator
 check_message_exists() {
     local folder_path="$1"
     local message_id="$2"
     local folder_name="$3"
     local temp_file="$TEMP_DIR/check_msg_$$_${RANDOM}.txt"
+    
+    # Get Dovecot's separator and convert path
+    local separator
+    separator=$(get_dovecot_separator)
+    local imap_folder="${folder_path//\//$separator}"
     
     # Check state cache first
     local cached_state
@@ -630,19 +703,22 @@ check_message_exists() {
     touch "$temp_file"
     chmod 600 "$temp_file"
     
+    # Clean message ID
+    message_id=$(echo "$message_id" | tr -d '\r' | tr -d '\n')
+    
     # Search for message on server
     (
         printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
         sleep 1
-        printf "a002 SELECT \"%s\"\r\n" "$folder_path"
+        printf "a002 SELECT \"%s\"\r\n" "$imap_folder"
         sleep 1
-        printf "a003 FETCH 1:* (BODY[HEADER.FIELDS (MESSAGE-ID)])\r\n"
+        printf "a003 SEARCH HEADER Message-ID \"%s\"\r\n" "$message_id"
         sleep 1
         printf "a004 LOGOUT\r\n"
     ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
     
-    # Check if message ID exists in response
-    if grep -qi "Message-ID:.*$message_id" "$temp_file"; then
+    # Check if message exists using SEARCH response
+    if grep -q "^\* SEARCH [1-9][0-9]*" "$temp_file"; then
         rm -f "$temp_file"
         log_message "Message found on server: $message_id"
         cache_message_state "$folder_name" "$message_id" "uploaded"
@@ -720,26 +796,8 @@ verify_message_upload() {
     return 1
 }
 
-# ====================
-# Message Operations
-# ====================
 
-# Function to extract Message-ID from email file
-get_message_id() {
-    local message_file="$1"
-    local msg_id
-    
-    # Try to get Message-ID header
-    msg_id=$(grep -i "^Message-ID:" "$message_file" | head -1 | sed 's/^Message-ID: *//i' | tr -d '<>')
-    
-    # If no Message-ID found, generate one from content hash
-    if [ -z "$msg_id" ]; then
-        msg_id=$(md5sum "$message_file" | cut -d' ' -f1)
-        log_message "No Message-ID found, using content hash: $msg_id"
-    fi
-    
-    echo "$msg_id"
-}
+
 
 # Function to verify message integrity
 verify_message_integrity() {
@@ -804,119 +862,120 @@ verify_message_integrity() {
 # ====================
 
 # Function to upload message with retry and validation
-upload_message() {
-    local message_file="$1"
-    local folder_path="$2"
-    local folder_name="$3"
-    local retries=0
-    local job_id="$$_${RANDOM}"
-    local temp_file="$TEMP_DIR/upload_msg_${job_id}.txt"
-    local cmd_file="$TEMP_DIR/upload_cmd_${job_id}.txt"
+# upload_message() {
+#     local message_file="$1"
+#     local folder_path="$2"
+#     local folder_name="$3"
+#     local retries=0
+#     local job_id="$$_${RANDOM}"
+#     local temp_file="$TEMP_DIR/upload_msg_${job_id}.txt"
+#     local cmd_file="$TEMP_DIR/upload_cmd_${job_id}.txt"
     
-    write_job_status "$job_id" "start" "Beginning upload process"
+#     write_job_status "$job_id" "start" "Beginning upload process"
     
-    # Get message ID first for duplicate checking
-    local message_id
-    message_id=$(get_message_id "$message_file")
-    if [ -z "$message_id" ]; then
-        log_message "Failed to get message identifier, skipping upload"
-        write_job_status "$job_id" "failed" "No Message-ID available"
-        update_upload_stats "$folder_name" 1 0 "false"
-        return 1
-    fi
+#     # Get message ID first for duplicate checking
+#     local message_id
+#     message_id=$(get_message_id "$message_file")
+#     if [ -z "$message_id" ]; then
+#         log_message "Failed to get message identifier, skipping upload"
+#         write_job_status "$job_id" "failed" "No Message-ID available"
+#         update_upload_stats "$folder_name" 1 0 "false"
+#         return 1
+#     fi
     
-    # Check if message already exists before doing anything else
-    if check_message_exists "$folder_path" "$message_id" "$folder_name"; then
-        local message_size
-        message_size=$(stat -c%s "$message_file")
-        log_message "Message already exists, skipping (ID: $message_id)"
-        write_job_status "$job_id" "skipped" "Message already exists"
-        update_upload_stats "$folder_name" 1 "$message_size" "skipped"
-        return 0
-    fi
+#     # Check if message already exists before doing anything else
+#     if check_message_exists "$folder_path" "$message_id" "$folder_name"; then
+#         local message_size
+#         message_size=$(stat -c%s "$message_file")
+#         log_message "Message already exists, skipping (ID: $message_id)"
+#         write_job_status "$job_id" "skipped" "Message already exists"
+#         update_upload_stats "$folder_name" 1 "$message_size" "skipped"
+#         return 0
+#     fi
     
-    # Verify message integrity
-    if ! verify_message_integrity "$message_file"; then
-        log_message "Message integrity check failed: $message_file"
-        write_job_status "$job_id" "failed" "Integrity check failed"
-        update_upload_stats "$folder_name" 1 0 "false"
-        return 1
-    fi
+#     # Verify message integrity
+#     if ! verify_message_integrity "$message_file"; then
+#         log_message "Message integrity check failed: $message_file"
+#         write_job_status "$job_id" "failed" "Integrity check failed"
+#         update_upload_stats "$folder_name" 1 0 "false"
+#         return 1
+#     fi
     
-    # Get message size
-    local message_size
-    message_size=$(stat -c%s "$message_file")
+#     # Get message size
+#     local message_size
+#     message_size=$(stat -c%s "$message_file")
     
-    log_message "Uploading message to $folder_path (size: $message_size bytes, ID: $message_id)"
-    write_job_status "$job_id" "uploading" "Size: $message_size bytes, ID: $message_id"
+#     log_message "Uploading message to $folder_path (size: $message_size bytes, ID: $message_id)"
+#     write_job_status "$job_id" "uploading" "Size: $message_size bytes, ID: $message_id"
     
-    # Create temp files with secure permissions
-    touch "$temp_file" "$cmd_file"
-    chmod 600 "$temp_file" "$cmd_file"
+#     # Create temp files with secure permissions
+#     touch "$temp_file" "$cmd_file"
+#     chmod 600 "$temp_file" "$cmd_file"
     
-    local upload_success=false
+#     local upload_success=false
     
-    while [ $retries -lt $MAX_RETRIES ] && [ "$upload_success" = "false" ]; do
-        # Check again if message exists before each attempt
-        if check_message_exists "$folder_path" "$message_id" "$folder_name"; then
-            log_message "Message appeared on server during retry, skipping (ID: $message_id)"
-            write_job_status "$job_id" "skipped" "Message appeared during retry"
-            update_upload_stats "$folder_name" 1 "$message_size" "skipped"
-            rm -f "$temp_file" "$cmd_file"
-            return 0
-        fi
+#     while [ $retries -lt $MAX_RETRIES ] && [ "$upload_success" = "false" ]; do
+#         # Check again if message exists before each attempt
+#         if check_message_exists "$folder_path" "$message_id" "$folder_name"; then
+#             log_message "Message appeared on server during retry, skipping (ID: $message_id)"
+#             write_job_status "$job_id" "skipped" "Message appeared during retry"
+#             update_upload_stats "$folder_name" 1 "$message_size" "skipped"
+#             rm -f "$temp_file" "$cmd_file"
+#             return 0
+#         fi
         
-        # Create command file for upload
-        {
-            printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
-            sleep 1
-            printf "a002 APPEND \"%s\" (\\Seen) {%d}\r\n" "$folder_path" "$message_size"
-            sleep 1
-            cat "$message_file"
-            printf "\r\n"
-            sleep 1
-            printf "a003 LOGOUT\r\n"
-        } > "$cmd_file"
+#         # Create command file for upload
+#         {
+#             printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+#             sleep 1
+#             printf "a002 APPEND \"%s\" (\\Seen) {%d}\r\n" "$folder_path" "$message_size"
+#             sleep 1
+#             cat "$message_file"
+#             printf "\r\n"
+#             sleep 1
+#             printf "a003 LOGOUT\r\n"
+#         } > "$cmd_file"
         
-        # Execute upload with timeout
-        if timeout 30 cat "$cmd_file" | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"; then
-            if grep -q "^a002 OK" "$temp_file"; then
-                # Mark success if OK response received
-                upload_success=true
-            else
-                log_message "Upload command failed, retrying..."
-            fi
-        else
-            log_message "Upload timed out or connection failed, retrying..."
-        fi
+#         # Execute upload with timeout
+#         if timeout 30 cat "$cmd_file" | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"; then
+#             if grep -q "^a002 OK" "$temp_file"; then
+#                 # Mark success if OK response received
+#                 upload_success=true
+#             else
+#                 log_message "Upload command failed, retrying..."
+#             fi
+#         else
+#             log_message "Upload timed out or connection failed, retrying..."
+#         fi
         
-        if [ "$upload_success" = "false" ]; then
-            retries=$((retries + 1))
-            if [ $retries -lt $MAX_RETRIES ]; then
-                sleep $RETRY_DELAY
-            fi
-        fi
-    done
+#         if [ "$upload_success" = "false" ]; then
+#             retries=$((retries + 1))
+#             if [ $retries -lt $MAX_RETRIES ]; then
+#                 sleep $RETRY_DELAY
+#             fi
+#         fi
+#     done
     
-    rm -f "$temp_file" "$cmd_file"
+#     rm -f "$temp_file" "$cmd_file"
     
-    if [ "$upload_success" = "true" ]; then
-        # Verify upload and update stats
-        if verify_message_upload "$folder_path" "$message_id" "$folder_name"; then
-            update_upload_stats "$folder_name" 1 "$message_size" "true"
-            write_job_status "$job_id" "completed" "Successfully uploaded and verified"
-            log_message "Successfully uploaded and verified message (size: $message_size bytes, ID: $message_id)"
-            return 0
-        else
-            log_message "Upload appeared successful but verification failed (ID: $message_id)"
-        fi
-    fi
+#     if [ "$upload_success" = "true" ]; then
+#         # Verify upload and update stats
+#         if verify_message_upload "$folder_path" "$message_id" "$folder_name"; then
+#             update_upload_stats "$folder_name" 1 "$message_size" "true"
+#             write_job_status "$job_id" "completed" "Successfully uploaded and verified"
+#             log_message "Successfully uploaded and verified message (size: $message_size bytes, ID: $message_id)"
+#             return 0
+#         else
+#             log_message "Upload appeared successful but verification failed (ID: $message_id)"
+#         fi
+#     fi
     
-    log_message "Failed to upload message after $MAX_RETRIES attempts (ID: $message_id)"
-    write_job_status "$job_id" "failed" "Failed after $MAX_RETRIES attempts"
-    update_upload_stats "$folder_name" 1 0 "false"
-    return 1
-}
+#     log_message "Failed to upload message after $MAX_RETRIES attempts (ID: $message_id)"
+#     write_job_status "$job_id" "failed" "Failed after $MAX_RETRIES attempts"
+#     update_upload_stats "$folder_name" 1 0 "false"
+#     return 1
+# }
+
 
 # Function to verify folder content
 verify_folder_content() {
@@ -1007,6 +1066,7 @@ verify_folder_content() {
 }
 
 
+
 # Function to preserve folder hierarchy in stats
 update_upload_stats() {
     local folder_path="$1"  # Now using full path
@@ -1079,11 +1139,318 @@ create_imap_folder_hierarchy() {
 }
 
 
+# Function to get IMAP folder delimiter
+get_folder_delimiter() {
+    local temp_file="$TEMP_DIR/folder_delimiter_$$_${RANDOM}.txt"
+    local delimiter="/"  # Default delimiter
+    
+    # Create temp file with secure permissions
+    touch "$temp_file"
+    chmod 600 "$temp_file"
+    
+    # Get folder delimiter from server
+    (
+        printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+        sleep 1
+        printf "a002 LIST \"\" \"\"\r\n"
+        sleep 1
+        printf "a003 LOGOUT\r\n"
+    ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+    
+    # Extract delimiter from response
+    local server_delimiter
+    server_delimiter=$(grep -o 'LIST.*"".*""' "$temp_file" | grep -o '"\([^"]*\)"' | tail -1 | tr -d '"')
+    
+    if [ ! -z "$server_delimiter" ]; then
+        delimiter="$server_delimiter"
+    fi
+    
+    rm -f "$temp_file"
+    echo "$delimiter"
+}
+
+# Function to get Dovecot's folder separator
+get_dovecot_separator() {
+    local temp_file="$TEMP_DIR/separator_$$_${RANDOM}.txt"
+    local separator="."  # Default for Dovecot
+    
+    # Create temp file with secure permissions
+    touch "$temp_file"
+    chmod 600 "$temp_file"
+    
+    # Query server for separator
+    (
+        printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+        sleep 1
+        printf "a002 LIST \"\" \"\"\r\n"
+        sleep 1
+        printf "a003 LOGOUT\r\n"
+    ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+    
+    # Extract separator - Dovecot usually shows it in LIST response
+    local found_sep
+    found_sep=$(grep "LIST.*(\"|\")" "$temp_file" | grep -o '"\([^"]*\)"' | tail -1 | tr -d '"')
+    
+    if [ ! -z "$found_sep" ]; then
+        separator="$found_sep"
+    fi
+    
+    rm -f "$temp_file"
+    echo "$separator"
+}
+
+# Function to list existing IMAP folders
+list_imap_folders() {
+    local temp_file="$TEMP_DIR/list_folders_$$_${RANDOM}.txt"
+    
+    touch "$temp_file"
+    chmod 600 "$temp_file"
+    
+    (
+        printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+        sleep 1
+        printf "a002 LIST \"\" \"*\"\r\n"
+        sleep 1
+        printf "a003 LOGOUT\r\n"
+    ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+    
+    # Get list of existing folders
+    grep "^* LIST" "$temp_file" | sed 's/^* LIST.*"\([^"]*\)"$/\1/' > "$TEMP_DIR/folder_list"
+    
+    rm -f "$temp_file"
+}
+
+# Function to create IMAP folder with Dovecot specifics
+create_imap_folder() {
+    local folder_path="$1"
+    local retries=0
+    local temp_file="$TEMP_DIR/create_folder_$$_${RANDOM}.txt"
+    
+    # Clean path
+    folder_path=$(clean_path "$folder_path")
+    
+    # Get Dovecot's separator
+    local separator
+    separator=$(get_dovecot_separator)
+    
+    # Convert path separator to Dovecot's
+    local imap_path="${folder_path//\//$separator}"
+    
+    touch "$temp_file"
+    chmod 600 "$temp_file"
+    
+    log_message "Creating Dovecot IMAP folder: $imap_path"
+    
+    # First check if it exists
+    list_imap_folders
+    if grep -Fq "$imap_path" "$TEMP_DIR/folder_list"; then
+        log_message "Folder already exists: $imap_path"
+        rm -f "$temp_file"
+        return 0
+    fi
+    
+    # If this is a nested folder, ensure parent exists
+    if [[ "$folder_path" == *"/"* ]]; then
+        local parent_folder="${folder_path%/*}"
+        local parent_imap="${parent_folder//\//$separator}"
+        
+        log_message "Checking parent folder: $parent_imap"
+        
+        # Create parent if needed
+        if ! grep -Fq "$parent_imap" "$TEMP_DIR/folder_list"; then
+            if ! create_imap_folder "$parent_folder"; then
+                log_message "Failed to create parent folder: $parent_folder"
+                rm -f "$temp_file"
+                return 1
+            fi
+        fi
+    fi
+    
+    # Create the folder
+    while [ $retries -lt $MAX_RETRIES ]; do
+        (
+            printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+            sleep 1
+            printf "a002 CREATE \"%s\"\r\n" "$imap_path"
+            sleep 1
+            # Verify creation
+            printf "a003 LIST \"\" \"%s\"\r\n" "$imap_path"
+            sleep 1
+            printf "a004 LOGOUT\r\n"
+        ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+        
+        # Check if creation was successful
+        if grep -q "^a002 OK\|ALREADYEXISTS" "$temp_file" || grep -q "^* LIST.*\"$imap_path\"" "$temp_file"; then
+            rm -f "$temp_file"
+            log_message "Folder created successfully: $imap_path"
+            return 0
+        fi
+        
+        log_message "Failed to create folder, retrying in $RETRY_DELAY seconds..."
+        cat "$temp_file" | grep "^a002" | log_message
+        sleep $RETRY_DELAY
+        retries=$((retries + 1))
+    done
+    
+    rm -f "$temp_file"
+    log_message "Failed to create folder after $MAX_RETRIES attempts: $imap_path"
+    return 1
+}
+
+# Function to create IMAP folder with proper delimiter handling
+# create_imap_folder() {
+#     local folder_path="$1"
+#     local retries=0
+#     local temp_file="$TEMP_DIR/create_folder_$$_${RANDOM}.txt"
+    
+#     # Clean path
+#     folder_path=$(clean_path "$folder_path")
+    
+#     # Get IMAP folder delimiter
+#     local delimiter
+#     delimiter=$(get_folder_delimiter)
+    
+#     # Convert path delimiter to IMAP delimiter
+#     local imap_path="${folder_path//\//$delimiter}"
+    
+#     # Create temp file with secure permissions
+#     touch "$temp_file"
+#     chmod 600 "$temp_file"
+    
+#     log_message "Creating IMAP folder: $folder_path"
+    
+#     # Create parent folders first if needed
+#     if [[ "$folder_path" == *"/"* ]]; then
+#         local parent_folder="${folder_path%/*}"
+#         log_message "Creating parent folder: $parent_folder"
+        
+#         # Create parent first
+#         if ! create_imap_folder "$parent_folder"; then
+#             rm -f "$temp_file"
+#             return 1
+#         fi
+#     fi
+    
+#     # Now create the actual folder
+#     while [ $retries -lt $MAX_RETRIES ]; do
+#         (
+#             printf "a001 LOGIN \"%s\" \"%s\"\r\n" "$DEST_USER" "$DEST_PASS"
+#             sleep 1
+#             printf "a002 CREATE \"%s\"\r\n" "$imap_path"
+#             sleep 1
+#             printf "a003 LOGOUT\r\n"
+#         ) | openssl s_client -connect "$DEST_SERVER:$DEST_PORT" $OPENSSL_OPTS 2>/dev/null > "$temp_file"
+        
+#         if grep -q "^a002 OK\|ALREADYEXISTS" "$temp_file"; then
+#             rm -f "$temp_file"
+#             log_message "Folder ready: $folder_path"
+#             return 0
+#         fi
+        
+#         log_message "Failed to create folder, retrying in $RETRY_DELAY seconds..."
+#         sleep $RETRY_DELAY
+#         retries=$((retries + 1))
+#     done
+    
+#     rm -f "$temp_file"
+#     log_message "Failed to create folder after $MAX_RETRIES attempts: $folder_path"
+#     return 1
+# }
 
 
-# Modified main function to handle root folders properly
+
+
+
+
+
+
+# Function to process folder uploads with proper hierarchy preservation
+process_folder_uploads() {
+    local source_folder="$1"
+    local dest_folder="$2"
+    local depth="${3:-0}"
+    local max_depth=10
+    
+    # Clean paths
+    source_folder=$(clean_path "$source_folder")
+    dest_folder=$(clean_path "$dest_folder")
+    
+    # Get relative path for stats
+    local relative_path="${source_folder#messages/}"
+    local lock_file="$LOCK_DIR/folder_${relative_path//\//_}.lock"
+    
+    log_message "Processing folder uploads for: $relative_path (depth: $depth)"
+    
+    # Create stats directory maintaining hierarchy
+    local stats_path="$STATS_DIR/folders/$relative_path"
+    mkdir -p "$stats_path"
+    
+    # Prevent infinite recursion
+    if [ "$depth" -ge "$max_depth" ]; then
+        log_message "WARNING: Maximum folder depth reached for $relative_path"
+        return 0
+    fi
+    
+    # Create IMAP folder
+    if ! create_imap_folder "$dest_folder"; then
+        log_message "Failed to create folder: $dest_folder"
+        return 1
+    fi
+    
+    # Process messages in current folder
+    local message_processed=0
+    for message_file in "$source_folder"/*.eml; do
+        if [ -f "$message_file" ]; then
+            # Get clean message ID
+            local message_id
+            message_id=$(get_message_id "$message_file")
+            
+            if [ -z "$message_id" ]; then
+                log_message "Failed to get message identifier, skipping: $message_file"
+                continue
+            fi
+            
+            # Check for duplicates
+            if check_message_exists "$dest_folder" "$message_id" "$relative_path"; then
+                local message_size
+                message_size=$(stat -c%s "$message_file")
+                log_message "Message already exists, skipping (ID: $message_id)"
+                update_upload_stats "$relative_path" 1 "$message_size" "skipped"
+                continue
+            fi
+            
+            # Upload message
+            if upload_message "$message_file" "$dest_folder" "$relative_path"; then
+                message_processed=1
+            fi
+            sleep $REQUEST_DELAY
+        fi
+    done
+    
+    # Process subfolders recursively while maintaining hierarchy
+    for subfolder in "$source_folder"/*/; do
+        if [ -d "$subfolder" ]; then
+            local sub_name=$(basename "$subfolder")
+            local sub_dest="$dest_folder/$sub_name"
+            local sub_source="$source_folder/$sub_name"
+            
+            process_folder_uploads "$sub_source" "$sub_dest" "$((depth + 1))"
+            sleep $REQUEST_DELAY
+        fi
+    done
+    
+    return 0
+}
+
+
+
+
+
+
+
+# Update main function to handle hierarchy properly
 main() {
-    log_message "Starting upload to Modoboa script v43..."
+    log_message "Starting upload to Modoboa script v42.0.7..."
     
     # Initialize directories
     init_directories
@@ -1110,17 +1477,11 @@ main() {
     for root_folder in messages/*/; do
         if [ -d "$root_folder" ]; then
             local folder_name=$(basename "$root_folder")
-            log_message "Processing root folder: $folder_name"
+            log_message "Processing root folder and hierarchy: $folder_name"
             
-            # Process the folder and all its subfolders
             if ! process_folder_uploads "$root_folder" "$folder_name" 0; then
                 log_message "Failed to process folder hierarchy: $folder_name"
                 continue
-            fi
-            
-            # Verify folder content
-            if ! verify_folder_content "$root_folder" "$folder_name"; then
-                log_message "Content verification failed for: $folder_name"
             fi
             
             # Rate limiting delay between root folders
@@ -1130,6 +1491,7 @@ main() {
     
     log_message "Upload process completed"
 }
+
 
 
 
